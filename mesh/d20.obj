@@ -1,0 +1,36 @@
+# D20 Dice - Icosahedron Model
+# Vertices
+v  0.000  0.000  1.000  # Vertex 1
+v  0.894  0.000  0.447  # Vertex 2
+v  0.276  0.851  0.447  # Vertex 3
+v -0.724  0.526  0.447  # Vertex 4
+v -0.724 -0.526  0.447  # Vertex 5
+v  0.276 -0.851  0.447  # Vertex 6
+v  0.724  0.526 -0.447  # Vertex 7
+v -0.276  0.851 -0.447  # Vertex 8
+v -0.894  0.000 -0.447  # Vertex 9
+v -0.276 -0.851 -0.447  # Vertex 10
+v  0.724 -0.526 -0.447  # Vertex 11
+v  0.000  0.000 -1.000  # Vertex 12
+
+# Faces
+f  1  2  3  # Face 1
+f  1  3  4  # Face 2
+f  1  4  5  # Face 3
+f  1  5  6  # Face 4
+f  1  6  2  # Face 5
+f  2  7  3  # Face 6
+f  3  7  8  # Face 7
+f  3  8  4  # Face 8
+f  4  8  9  # Face 9
+f  4  9  5  # Face 10
+f  5  9 10  # Face 11
+f  5 10  6  # Face 12
+f  6 10 11  # Face 13
+f  6 11  2  # Face 14
+f  2 11  7  # Face 15
+f  7 12  8  # Face 16
+f  8 12  9  # Face 17
+f  9 12 10  # Face 18
+f 10 12 11  # Face 19
+f 11 12  7  # Face 20
