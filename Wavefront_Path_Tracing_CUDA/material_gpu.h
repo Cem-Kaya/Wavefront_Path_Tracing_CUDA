@@ -173,4 +173,32 @@ __device__ bool scatter(
     return false;
 }
 
+// Shadow Ray Calculation
+__device__ bool is_in_shadow(
+    const Vec3& hitPosition,        // Surface hit position
+    const Vec3& lightPos,           // Light position
+    const Triangle* d_triangles,    // Pointer to all triangles
+    int numTriangles                // Number of triangles
+) {
+    // Shadow ray direction and distance
+    Vec3 toLight = (lightPos - hitPosition).normalized();
+    float lightDist = (lightPos - hitPosition).length();
+
+    // Shadow ray setup
+    Ray shadowRay;
+    shadowRay.origin = hitPosition + toLight * 1e-4f; // Offset to avoid self-intersection
+    shadowRay.direction = toLight;
+
+    // Test against all triangles
+    for (int i = 0; i < numTriangles; ++i) {
+        float t, u, v;
+        if (intersectTriangleMT(shadowRay, d_triangles[i], t, u, v)) {
+            if (t > 0.f && t < lightDist) {
+                return true; // Blocked by an object
+            }
+        }
+    }
+    return false; // No obstruction
+}
+
 #endif // MATERIAL_GPU_H

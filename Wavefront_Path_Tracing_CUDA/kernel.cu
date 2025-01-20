@@ -205,11 +205,12 @@ __global__ void shadeKernel(
 	Triangle* d_triangles,
 	GPU_Material* d_materials,
 	curandState* d_randStates,
-	int           width,
-	int           height,
-	int           numTriangles
-)
-{
+	int width,
+	int height,
+	int numTriangles,
+	Vec3 lightPos,   // Light source position
+	Vec3 lightColor  // Light source color
+) {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x >= width || y >= height) return;
@@ -218,9 +219,9 @@ __global__ void shadeKernel(
 	hit_record& rec = d_hit_records[idx];
 	Ray& ray = d_rays[idx];
 
-	if (!rec.active) return;           // no need to shade if inactive
+	if (!rec.active) return;           // No need to shade if inactive
 	if (!rec.didHit) {
-		// sky color, etc.
+		// Sky color for rays that missed
 		rec.accumulatedColor = rec.accumulatedColor + rec.throughput * make_vec3(0.5f, 0.7f, 1.0f);
 		rec.active = false;
 		return;
@@ -234,16 +235,26 @@ __global__ void shadeKernel(
 	}
 
 	Triangle tri = d_triangles[triIdx];
-	GPU_Material m = d_materials[tri.materialID];
+	GPU_Material mat = d_materials[tri.materialID];
 
-	// 1) Emission
-	Vec3 emission = emitted(m, rec);
+	// Emission
+	Vec3 emission = emitted(mat, rec);
 	rec.accumulatedColor = rec.accumulatedColor + rec.throughput * emission;
 
-	// 2) Scatter
+	// Shadow ray check
+	bool inShadow = is_in_shadow(rec.hitPosition, lightPos, d_triangles, numTriangles);
+
+	if (!inShadow) {
+		// Lambertian diffuse shading
+		Vec3 toLight = (lightPos - rec.hitPosition).normalized();
+		float diffuse = rec.normal.dot(toLight);
+		rec.accumulatedColor = rec.accumulatedColor + rec.throughput * lightColor * mat.albedo * diffuse;
+	}
+
+	// Scatter (for indirect illumination)
 	Vec3 attenuation;
 	Ray scattered;
-	bool didScatter = scatter(m, ray, rec, attenuation, scattered, d_randStates, idx);
+	bool didScatter = scatter(mat, ray, rec, attenuation, scattered, d_randStates, idx);
 
 	if (didScatter) {
 		rec.throughput = rec.throughput * attenuation;
@@ -281,7 +292,9 @@ void shadeRays(
 		d_randStates,
 		width,
 		height,
-		numTriangles
+		numTriangles,
+		lightPos,
+		lightColor
 		);
 	CUDA_CHECK(cudaDeviceSynchronize());
 }
