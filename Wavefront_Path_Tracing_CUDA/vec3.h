@@ -27,6 +27,11 @@ struct Vec3
         return Vec3(x * s, y * s, z * s);
     }
 
+    __host__ __device__ inline Vec3 operator/(float s) const
+    {
+        return Vec3(x / s, y / s, z / s);
+    }
+
     __host__ __device__ inline Vec3 operator*(const Vec3& v) const
     {
         return Vec3(x * v.x, y * v.y, z * v.z);
@@ -47,6 +52,9 @@ struct Vec3
         float len = length();
         return (len > 0) ? (*this) * (1.0f / len) : Vec3(0, 0, 0);
     }
+    
+
+
 };
 
 // Utility function

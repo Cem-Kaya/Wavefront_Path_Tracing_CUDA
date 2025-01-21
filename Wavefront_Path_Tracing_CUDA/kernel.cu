@@ -9,7 +9,7 @@
 #include <vector>
 #include <string>
 
-
+#include "vec3.h"
 #include "cam.h"
 #include "ray.h"
 #include "hit_record.h"
@@ -52,7 +52,30 @@ void initCurandStates(curandState * d_states, int width, int height, unsigned lo
 	cudaDeviceSynchronize();
 }
 
+// helper: sample a random luminous triangle from an array of indices
+__device__ int pickRandomLightIndex(const int* d_lightIndices, int numLights, curandState* randState)
+{
+	// uniform pick among the lights
+	int which = curand(randState) % numLights; // integer pick
+	return d_lightIndices[which];
+}
 
+// helper: sample a random point on a triangle
+__device__ Vec3 samplePointOnTriangle(const Triangle& tri, curandState* randState)
+{
+	float r1 = curand_uniform(randState);
+	float r2 = curand_uniform(randState);
+
+
+	// If r1 + r2 > 1, flip them to remain in the triangle
+	if (r1 + r2 > 1.f) {
+		r1 = 1.f - r1;
+		r2 = 1.f - r2;
+	}
+	// point = v0 + r1*(v1-v0) + r2*(v2-v0)
+	Vec3 p = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
+	return p;
+}
 
 
 //////////////////////////////////////////////
@@ -220,8 +243,8 @@ __global__ void shadeKernel(
 
 	if (!rec.active) return;           // no need to shade if inactive
 	if (!rec.didHit) {
-		// sky color, etc.
-		rec.accumulatedColor = rec.accumulatedColor + rec.throughput * make_vec3(0.5f, 0.7f, 1.0f);
+		// skycolor, bckgroundm dusk color  !!!!!!!!!!!!!!!!!!!!!!!!
+		rec.accumulatedColor = rec.accumulatedColor + rec.throughput * make_vec3(0.1f, 0.1f, 0.1f); // make_vec3(0.3f, 0.42f, 0.60f);
 		rec.active = false;
 		return;
 	}
@@ -290,6 +313,181 @@ void shadeRays(
 
 
 
+// Kernel that generates shadow rays for next-event estimation
+__global__ void generateShadowRaysKernel(
+	hit_record* d_hit_records,
+	Ray* d_primaryRays,
+	Triangle* d_triangles,
+	GPU_Material* d_materials,
+	const int* d_lightIndices,
+	int numLights,
+	ShadowRay* d_shadowRays,
+	int width,
+	int height,
+	curandState* d_randStates)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	int idx = y * width + x;
+	hit_record& rec = d_hit_records[idx];
+
+	// If path ended or no hit => skip
+	if (!rec.active || !rec.didHit) {
+		d_shadowRays[idx].active = false;
+		return;
+	}
+
+	// Find the material of the triangle we just hit
+	int triIdx = rec.triangleIndex;
+	Triangle tri = d_triangles[triIdx];
+	GPU_Material hitMat = d_materials[tri.materialID];
+
+	// ONLY do next-event estimation if it's Lambertian
+	if (hitMat.type != MATERIAL_LAMBERTIAN) {
+		d_shadowRays[idx].active = false;
+		return;
+	}
+
+	// Otherwise, do your normal shadow‐ray logic:
+	curandState* rs = &d_randStates[idx];
+
+	// 1) Pick a random luminous triangle
+	int lightIndex = pickRandomLightIndex(d_lightIndices, numLights, rs);
+	Triangle lightTri = d_triangles[lightIndex];
+	GPU_Material lightMat = d_materials[lightTri.materialID];
+
+	// 2) Sample a random point on the light
+	Vec3 lightPoint = samplePointOnTriangle(lightTri, rs);
+
+	// 3) Create the shadow ray
+	Vec3 origin = rec.hitPosition + rec.normal * 0.001f; // offset
+	Vec3 dir = lightPoint - origin;
+	float dist = dir.length();
+	dir = dir / dist;  // normalize
+
+	ShadowRay& sray = d_shadowRays[idx];
+	sray.pixelIdx = idx;
+	sray.ray.origin = origin;
+	sray.ray.direction = dir;
+	sray.active = true;
+
+	// Store distance, light normal, etc.
+	sray.distanceToLight = dist;
+	sray.lightNormal = lightTri.normal.normalized();
+	sray.lightEmission = lightMat.emission;
+
+	
+}
+
+
+
+
+// Kernel that intersects shadow rays
+__global__ void extendShadowRaysKernel(
+	ShadowRay* d_shadowRays,
+	Triangle* d_triangles,
+	int numTriangles,
+	shadow_hit_record* d_shadowHitRecords,
+	int width,
+	int height)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	int idx = y * width + x;
+	ShadowRay& sray = d_shadowRays[idx];
+
+	if (!sray.active) {
+		d_shadowHitRecords[idx].didHit = false;
+		d_shadowHitRecords[idx].t = -1.f;
+		return;
+	}
+
+	Ray r = sray.ray;
+
+	float tMin = 1e30f;
+	bool hitSomething = false;
+
+	// For each triangle, test intersection
+	for (int i = 0; i < numTriangles; i++) {
+		float t, u, v;
+		bool hit = intersectTriangleMT(r, d_triangles[i], t, u, v);
+		// We only care if there is ANY intersection up to the distance to the light
+		// We'll keep track of nearest for completeness
+		if (hit && t < tMin && t > 0.0001f) {
+			tMin = t;
+			hitSomething = true;
+		}
+	}
+
+	d_shadowHitRecords[idx].didHit = hitSomething;
+	d_shadowHitRecords[idx].t = (hitSomething) ? tMin : -1.f;
+}
+
+
+//  a kernel to accumulate the shadow 
+__global__ void finalizeShadowKernel(
+	hit_record* d_hit_records,
+	ShadowRay* d_shadowRays,
+	shadow_hit_record* d_shadowHits,
+	int width,
+	int height)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	int idx = y * width + x;
+	ShadowRay& sray = d_shadowRays[idx];
+	if (!sray.active) {
+		// No shadow ray => do nothing
+		return;
+	}
+
+	shadow_hit_record& sh = d_shadowHits[idx];
+
+	// 1) Distance check: if the shadow ray hits *before* it reaches the light
+	//    => inShadow = true
+	bool inShadow = false;
+	if (sh.didHit) {
+		float eps = 1e-4f;
+		if (sh.t > eps && sh.t < sray.distanceToLight - eps) {
+			inShadow = true;
+		}
+	}
+
+	if (!inShadow) {
+		// 2) Not shadowed => accumulate direct light
+		int pixelIdx = sray.pixelIdx;
+
+		// surface normal at the shading point
+		Vec3 surfN = d_hit_records[pixelIdx].normal;
+		// direction from shading point to light
+		Vec3 L = sray.ray.direction;
+
+		// cosines
+		float cosSurf = fmaxf(0.f, surfN.dot( L));
+		float cosLight = fmaxf(0.f, sray.lightNormal.dot(  L* - 1.0f));
+
+		// distance^2 for 1/r^2 falloff
+		float dist2 = sray.distanceToLight * sray.distanceToLight;
+
+		// geometry factor
+		float G = (cosSurf * cosLight) / dist2;
+
+		// naive direct lighting
+		Vec3 direct = sray.brdfFactor * sray.lightEmission * G;
+
+		// accumulate
+		d_hit_records[pixelIdx].accumulatedColor = d_hit_records[pixelIdx].accumulatedColor +  direct;
+	}
+}
+
+
+
 
 
 
@@ -303,50 +501,147 @@ void shadeRays(
 
 
 // Debug function 
-// Suppose you have some triangles in a host array:
-void createMaterials(std::vector<GPU_Material>& mats) {
+// Suppose you have some triangles in a host array
+
+void createMaterials(std::vector<GPU_Material>& mats)
+{
+	mats.clear();
+	mats.reserve(12);
+
+	// 0) Lambertian White
 	{
-		// Lambertian material
 		GPU_Material lam;
 		lam.type = MATERIAL_LAMBERTIAN;
-		lam.albedo = make_vec3(0.8f, 0.3f, 0.3f);
-		lam.fuzz = 0.f;
-		lam.ir = 1.f;
+		lam.albedo = make_vec3(0.90f, 0.90f, 0.90f); // white
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
 		lam.emission = make_vec3(0.f, 0.f, 0.f);
 		mats.push_back(lam);
 	}
+
+	// 1) Lambertian Red
 	{
-		// Metal material
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(1.0f, 0.0f, 0.0f); // red
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 2) Lambertian Green
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(0.0f, 1.0f, 0.0f); // green
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 3) Lambertian Blue
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(0.0f, 0.0f, 1.0f); // blue
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 4) Lambertian Yellow
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(1.0f, 1.0f, 0.0f); // yellow
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 5) Lambertian Magenta
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(1.0f, 0.0f, 1.0f); // magenta
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 6) Lambertian Cyan
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(0.0f, 1.0f, 1.0f); // cyan
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 7) Lambertian Orange
+	{
+		GPU_Material lam;
+		lam.type = MATERIAL_LAMBERTIAN;
+		lam.albedo = make_vec3(1.0f, 0.5f, 0.0f); // orange
+		lam.fuzz = 0.0f;
+		lam.ir = 1.0f;
+		lam.emission = make_vec3(0.f, 0.f, 0.f);
+		mats.push_back(lam);
+	}
+
+	// 8) Mirror-like Metal
+	{
 		GPU_Material metalMat;
 		metalMat.type = MATERIAL_METAL;
-		metalMat.albedo = make_vec3(0.8f, 0.8f, 0.8f);
-		metalMat.fuzz = 0.05f;
-		metalMat.ir = 1.f;
+		metalMat.albedo = make_vec3(0.95f, 0.95f, 0.95f); // near mirror
+		metalMat.fuzz = 0.0f;  // no fuzz => perfect reflection
+		metalMat.ir = 1.0f;
 		metalMat.emission = make_vec3(0.f, 0.f, 0.f);
 		mats.push_back(metalMat);
 	}
+
+	// 9) White Light
 	{
-		// Dielectric (glass)
-		GPU_Material glass;
-		glass.type = MATERIAL_DIELECTRIC;
-		glass.albedo = make_vec3(1.f, 1.f, 1.f);
-		glass.ir = 1.5f; // index of refraction
-		glass.fuzz = 0.f;
-		glass.emission = make_vec3(0.f, 0.f, 0.f);
-		mats.push_back(glass);
-	}
-	{
-		// Diffuse light
 		GPU_Material light;
 		light.type = MATERIAL_DIFFUSE_LIGHT;
-		light.albedo = make_vec3(1.f, 1.f, 1.f); // not used for scattering
+		light.albedo = make_vec3(1.f, 1.f, 1.f);
 		light.fuzz = 0.f;
 		light.ir = 1.f;
-		// Emission color
-		light.emission = make_vec3(5.f, 4.f, 2.f);
+		light.emission = make_vec3(5.f, 5.f, 5.f); // bright white
+		mats.push_back(light);
+	}
+
+	// 10) Red Light
+	{
+		GPU_Material light;
+		light.type = MATERIAL_DIFFUSE_LIGHT;
+		light.albedo = make_vec3(1.f, 0.f, 0.f);
+		light.fuzz = 0.f;
+		light.ir = 1.f;
+		light.emission = make_vec3(5.f, 0.f, 0.f); // bright red
+		mats.push_back(light);
+	}
+
+	// 11) Blue Light
+	{
+		GPU_Material light;
+		light.type = MATERIAL_DIFFUSE_LIGHT;
+		light.albedo = make_vec3(0.f, 0.f, 1.f);
+		light.fuzz = 0.f;
+		light.ir = 1.f;
+		light.emission = make_vec3(0.f, 0.f, 5.f); // bright blue
 		mats.push_back(light);
 	}
 }
+
+
 void createSimpleScene(std::vector<Triangle>& triangles) {
 	// Triangle with Lambertian material
 	Triangle tri;
@@ -359,8 +654,6 @@ void createSimpleScene(std::vector<Triangle>& triangles) {
 
 	// Another triangle with metal, etc.
 }
-
-// Example "bigger" scene
 void createMoreComplexScene(std::vector<Triangle>& triangles)
 {
 	triangles.clear();
@@ -431,7 +724,123 @@ void createMoreComplexScene(std::vector<Triangle>& triangles)
 	triangles.insert(triangles.end(), loadedTriangles.begin(), loadedTriangles.end());
 
 }
+void createEnclosedCubeScene(std::vector<Triangle>& triangles)
+{
+	triangles.clear();
 
+	float boxMin = 0.f;
+	float boxMax = 5.f;
+	float yCeiling = 5.f;
+
+	//
+	// 1) Floor: white lambert (ID=0)
+	//
+	{
+		Vec3 A(boxMin, 0.f, boxMin);
+		Vec3 B(boxMax, 0.f, boxMin);
+		Vec3 C(boxMax, 0.f, boxMax);
+		Vec3 D(boxMin, 0.f, boxMax);
+
+		triangles.push_back(makeTriangle(A, C, B, /*materialID=*/0));
+		triangles.push_back(makeTriangle(A, D, C, /*materialID=*/0));
+	}
+
+	//
+	// 2) Left Wall: red (ID=1)
+	//
+	{
+		Vec3 A(boxMin, 0.f, boxMax);
+		Vec3 B(boxMin, 0.f, boxMin);
+		Vec3 C(boxMin, yCeiling, boxMin);
+		Vec3 D(boxMin, yCeiling, boxMax);
+
+		triangles.push_back(makeTriangle(A, B, C, 1));
+		triangles.push_back(makeTriangle(A, C, D, 1));
+	}
+
+	//
+	// 3) Right Wall: green (ID=2)
+	//
+	{
+		Vec3 A(boxMax, 0.f, boxMin);
+		Vec3 B(boxMax, 0.f, boxMax);
+		Vec3 C(boxMax, yCeiling, boxMax);
+		Vec3 D(boxMax, yCeiling, boxMin);
+
+		triangles.push_back(makeTriangle(A, B, C, 3));
+		triangles.push_back(makeTriangle(A, C, D, 3));
+	}
+
+	//
+	// 4) Back Wall: white (ID=0)
+	//
+	{
+		Vec3 A(boxMin, 0.f, boxMax);
+		Vec3 B(boxMax, 0.f, boxMax);
+		Vec3 C(boxMax, yCeiling, boxMax);
+		Vec3 D(boxMin, yCeiling, boxMax);
+
+		triangles.push_back(makeTriangle(A, C, B, 0));
+		triangles.push_back(makeTriangle(A, D, C, 0));
+	}
+
+	//
+	// 5) Ceiling + Emissive Light
+	//
+	{
+		// Big white ceiling
+		Vec3 A(boxMin, yCeiling, boxMin);
+		Vec3 B(boxMax, yCeiling, boxMin);
+		Vec3 C(boxMax, yCeiling, boxMax);
+		Vec3 D(boxMin, yCeiling, boxMax);
+
+		triangles.push_back(makeTriangle(A, B, C, 0));
+		triangles.push_back(makeTriangle(A, C, D, 0));
+
+		// Smaller rectangle for the light (ID=3)
+		float lightSize = 2.f;
+		float start = (boxMax - lightSize) * 0.5f;
+		float end = start + lightSize;
+
+		Vec3 L1(start, yCeiling - 0.001f, start);
+		Vec3 L2(end, yCeiling - 0.001f, start);
+		Vec3 L3(end, yCeiling - 0.001f, end);
+		Vec3 L4(start, yCeiling - 0.001f, end);
+
+		triangles.push_back(makeTriangle(L1, L2, L3, 9));
+		triangles.push_back(makeTriangle(L1, L3, L4, 9));
+	}
+
+	//
+	// 6) Spheres: loaded from .obj, offset inside the box
+	//    We'll do two spheres with materialID=4 (maybe metal or glass).
+	//
+	{
+		// sphere_left.obj, offset it near the left
+		Vec3 offsetLeft = make_vec3(1.2f, 2.f, 2.0f);
+		std::vector<Triangle> sphereLeft = parseObj("../mesh/sphere.obj", /*materialID=*/1);
+
+		// Add the offset
+		for (auto& tri : sphereLeft) {
+			tri.v0 = tri.v0 +  offsetLeft;
+			tri.v1 = tri.v1 +  offsetLeft;
+			tri.v2 = tri.v2 +  offsetLeft;
+			tri.normal = computeNormal(tri.v0, tri.v1, tri.v2);
+		}
+		triangles.insert(triangles.end(), sphereLeft.begin(), sphereLeft.end());
+
+		// sphere_right.obj, offset it near the right
+		Vec3 offsetRight = make_vec3(3.2f, 3.0f, 5.0f);
+		std::vector<Triangle> sphereRight = parseObj("../mesh/sphere.obj", /*materialID=*/2);
+		for (auto& tri : sphereRight) {
+			tri.v0 = tri.v0 + offsetRight;
+			tri.v1 = tri.v1 + offsetRight;
+			tri.v2 = tri.v2 + offsetRight;
+			tri.normal = computeNormal(tri.v0, tri.v1, tri.v2);
+		}
+		triangles.insert(triangles.end(), sphereRight.begin(), sphereRight.end());
+	}
+}
 
 
 // Writes each pixel’s intersection data to CSV:
@@ -500,21 +909,163 @@ void writeImageToCSV(const char* filename,	const hit_record* d_hit_records,int w
 	std::cout << "Wrote final color CSV to " << filename << "\n";
 }
 
+// Assumes:
+//   - 'buffer' is an array of Vec3 (e.g. float RGB in [0..1])
+//   - 'width' and 'height' are image dimensions
+//   - We'll write rows top-to-bottom (so we start from the top row in typical image coords)
+
+void writeImageToPPM(const char* filename, const Vec3* buffer, int width, int height)
+{
+	std::ofstream file(filename);
+	if (!file.is_open()) {
+		std::cerr << "Error opening file " << filename << " for writing!\n";
+		return;
+	}
+
+	// Write the PPM header: P3, width, height, max color value
+	file << "P3\n" << width << " " << height << "\n255\n";
+
+	// Loop over rows top-to-bottom, left-to-right
+	// (PPM can be in any order, but top-to-bottom is common)
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			int idx = y * width + x;
+			
+
+			float r = buffer[idx].x;
+			float g = buffer[idx].y;
+			float b = buffer[idx].z;
+
+			// Clamp each color component to [0,1]
+			r = (r < 0.f) ? 0.f : ((r > 1.f) ? 1.f : r);
+			g = (g < 0.f) ? 0.f : ((g > 1.f) ? 1.f : g);
+			b = (b < 0.f) ? 0.f : ((b > 1.f) ? 1.f : b);
+
+			// Convert to [0..255]
+			int ir = static_cast<int>(255.99f * r);
+			int ig = static_cast<int>(255.99f * g);
+			int ib = static_cast<int>(255.99f * b);
+
+			file << ir << " " << ig << " " << ib << "\n";
+		}
+	}
+
+	file.close();
+	std::cout << "Wrote PPM to " << filename << "\n";
+}
+
+void convertAndOpenImage(const char* ppmFilename, const char* jpgFilename)
+{
+	// 1) Convert PPM to JPEG using ImageMagick
+	//    e.g. "magick convert input.ppm output.jpg"
+	{
+		std::string cmd = std::string("magick convert ")
+			+ ppmFilename
+			+ " "
+			+ jpgFilename;
+		int retCode = system(cmd.c_str());
+		if (retCode != 0) {
+			std::cerr << "ImageMagick conversion failed!\n";
+			return;
+		}
+	}
+
+	// 2) Open the resulting JPEG in your system's default viewer
+	//    On Windows:
+	{
+		std::string cmd = std::string("start ") + jpgFilename;
+		system(cmd.c_str());
+	}
+
+	// If you're on macOS, do:
+	//    std::string cmd = "open " + std::string(jpgFilename);
+
+	// If on Linux, do:
+	//    std::string cmd = "xdg-open " + std::string(jpgFilename);
+
+	std::cout << "Converted " << ppmFilename
+		<< " to " << jpgFilename
+		<< " and opened it.\n";
+}
+
+
+
+
+
+
+
+__global__ void accumulateKernel(
+	const hit_record* d_hit_records,
+	Vec3* d_accumBuffer,
+	int width,
+	int height)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	int idx = y * width + x;
+
+	// Add the color from this sample into the accumulation buffer
+	d_accumBuffer[idx] = d_accumBuffer[idx] + d_hit_records[idx].accumulatedColor;
+}
+
+__global__ void averageKernel(
+	Vec3* d_accumBuffer,
+	int width,
+	int height,
+	int samplesPerPixel)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+
+	int idx = y * width + x;
+	d_accumBuffer[idx] = d_accumBuffer[idx] * (1.0f / samplesPerPixel);
+}
+
+
+__global__ void setzerosKernel(
+	Vec3* d_accumBuffer,
+	int width,
+	int height,
+	int samplesPerPixel)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+	int idx = y * width + x;
+	d_accumBuffer[idx] = make_vec3(0.f, 0.f, 0.f);
+}
+
 
 int main()
 {
 	// Example image resolution
 	int width = 1920;
 	int height = 1080;
+	int maxBounces = 20;
+	int samplesPerPixel = 500; // for demonstration
+
+	Vec3* d_accumBuffer = nullptr;
+	cudaMallocManaged(&d_accumBuffer, width * height * sizeof(Vec3));
+
+	// Initialize the accumulation buffer to zero (on CPU or via a kernel)
+	for (int i = 0; i < width * height; i++) {
+		d_accumBuffer[i] = make_vec3(0.f, 0.f, 0.f);
+	}
+
+
 
 	// Create a camera on host
 	Camera h_camera;
 	h_camera.setLookAt(
-		make_vec3(0.f, 1.f, 3.f),   // position
-		make_vec3(0.f, 1.f, 0.f),   // target
-		make_vec3(0.f, 1.f, 0.f),   // up
-		45.0f,                      // fov
-		static_cast<float>(width) / static_cast<float>(height)
+		make_vec3(2.5f, 2.5f, -10.0f),  // camera position: 
+		//   x=2.5, y=2.5, z=-10  (in front of the box along negative Z)
+		make_vec3(2.5f, 2.5f, 2.5f),  // look at the center of the box
+		make_vec3(0.f, 1.f, 0.f), // 'up' vector
+		35.0f,                         // FOV in degrees
+		static_cast<float>(width) / static_cast<float>(height) // aspect ratio
 	);
 
 
@@ -556,7 +1107,9 @@ int main()
 	
 	//  Create scene triangles
 	std::vector<Triangle> h_triangles;
-	createMoreComplexScene(h_triangles);
+	//createMoreComplexScene(h_triangles);
+	createEnclosedCubeScene(h_triangles); 
+
 	int numTriangles = static_cast<int>(h_triangles.size());
 
 	// Allocate triangles on device (managed for simplicity)
@@ -572,50 +1125,155 @@ int main()
 
 
 
-	// 1) Generate rays
-	generatePrimaryRays(d_rays, d_hit_records, h_camera, width, height);
 
 
-	// 2) Extend stage (intersection)
-	//extendRays(d_rays, d_triangles, numTriangles, d_hit_records, width, height);
-
-	// ... At this point, d_hit_records contains intersection info so to double check i writte stuff to a csv file 
-	//writeDebugCSV("debug_output.csv", d_hit_records, width, height);
-
-	int samplesPerPixel = 10;  
-	int maxBounces = 8;
 
 
-	//  Vec3* buffer 
-	Vec3* d_finalColor = nullptr;
-	cudaMallocManaged(&d_finalColor, width * height * sizeof(Vec3));
 
-	//Initialize  on the CPU
-	for (int i = 0; i < width * height; i++) {
-		d_finalColor[i] = make_vec3(0.f, 0.f, 0.f);
+
+
+
+	// ---------------------------
+	// Identify Luminous Triangles
+	// ---------------------------
+	std::vector<int> lightIndices;
+	for (int i = 0; i < numTriangles; i++) {
+		// If the material is "MATERIAL_DIFFUSE_LIGHT", treat it as a light
+		int matID = h_triangles[i].materialID;
+		if (matID >= 0 && matID < numMaterials) {
+			if (h_mats[matID].type == MATERIAL_DIFFUSE_LIGHT) {
+				lightIndices.push_back(i);
+			}
+		}
+	}
+	int numLights = (int)lightIndices.size();
+	if (numLights == 0) {
+		std::cerr << "No emissive triangles found!\n";
 	}
 
+	// Copy light indices to device
+	int* d_lightIndices = nullptr;
+	CUDA_CHECK(cudaMallocManaged(&d_lightIndices, numLights * sizeof(int)));
+	cudaMemcpy(d_lightIndices, lightIndices.data(),
+		numLights * sizeof(int),
+		cudaMemcpyHostToDevice);
 
-	for (int bounce = 0; bounce < maxBounces; bounce++)
+	// Wavefront buffers for shadow rays
+	ShadowRay* d_shadowRays = nullptr;
+	CUDA_CHECK(cudaMallocManaged(&d_shadowRays, width * height * sizeof(ShadowRay)));
+
+	shadow_hit_record* d_shadowHitRecords = nullptr;
+	CUDA_CHECK(cudaMallocManaged(&d_shadowHitRecords, width * height * sizeof(shadow_hit_record)));
+
+
+
+
+
+
+
+	// -----------------------
+	// RENDER LOOP
+	// -----------------------
+	// We do multiple samples per pixel. 
+	for (int s = 0; s < samplesPerPixel; s++)
 	{
-		// 2) Extend stage (intersection)
-		extendRays(d_rays, d_triangles, numTriangles, d_hit_records, width, height);
+		// 1) Generate primary rays
+		generatePrimaryRays(d_rays, d_hit_records, h_camera, width, height);
 
+		// 2) For each bounce
+		for (int b = 0; b < maxBounces; b++)
+		{
+			// Extend rays
+			extendRays(d_rays, d_triangles, numTriangles, d_hit_records, width, height);
+
+			// Shade
+			{
+				dim3 block(16, 16);
+				dim3 grid((width + 15) / 16, (height + 15) / 16);
+				shadeKernel << <grid, block >> > (
+					d_hit_records,
+					d_rays,
+					d_triangles,
+					d_materials,
+					d_randStates,
+					width,
+					height,
+					numTriangles					
+					);
+				CUDA_CHECK(cudaDeviceSynchronize());
+			}
+
+			// Next-Event Estimation: generate shadow rays from each (active) path
+			{
+				dim3 block(16, 16);
+				dim3 grid((width + 15) / 16, (height + 15) / 16);
+				generateShadowRaysKernel << <grid, block >> > (
+					d_hit_records,
+					d_rays,
+					d_triangles,
+					d_materials,
+					d_lightIndices,
+					numLights,
+					d_shadowRays,
+					width,
+					height,
+					d_randStates
+					);
+				CUDA_CHECK(cudaDeviceSynchronize());
+			}
+
+			// Intersect shadow rays
+			{
+				dim3 block(16, 16);
+				dim3 grid((width + 15) / 16, (height + 15) / 16);
+				extendShadowRaysKernel << <grid, block >> > (
+					d_shadowRays,
+					d_triangles,
+					numTriangles,
+					d_shadowHitRecords,
+					width,
+					height
+					);
+				CUDA_CHECK(cudaDeviceSynchronize());
+			}
+
+			// Accumulate shadow
+			{
+				dim3 block(16, 16);
+				dim3 grid((width + 15) / 16, (height + 15) / 16);
+				finalizeShadowKernel << <grid, block >> > (
+					d_hit_records,
+					d_shadowRays,
+					d_shadowHitRecords,
+					width,
+					height
+					);
+				CUDA_CHECK(cudaDeviceSynchronize());
+			}
+
+			// (At this point, paths that remain active keep going to next bounce)
+			// If all paths are inactive, we could break early, but we won't check here for brevity.
+		} // end bounce loop
+
+
+		{
+			dim3 block(16, 16);
+			dim3 grid((width + 15) / 16, (height + 15) / 16);
+			accumulateKernel << <grid, block >> > (d_hit_records, d_accumBuffer, width, height);
+			CUDA_CHECK(cudaDeviceSynchronize());
+		}
 		
-		// 3) Shade (one bounce)
-		shadeRays(d_hit_records, d_rays, d_triangles, d_materials, d_randStates, width, height, numTriangles);
-
-
-		// (TODO) check if all rays are inactive:
+	} // end sample loop
+	{
+		dim3 block(16, 16);
+		dim3 grid((width + 15) / 16, (height + 15) / 16);
+		averageKernel << <grid, block >> > (d_accumBuffer, width, height, samplesPerPixel);
+		CUDA_CHECK(cudaDeviceSynchronize());
 	}
-
-
-
-
-
-
 
 	writeImageToCSV("final_color.csv", d_hit_records, width, height);
+	writeImageToPPM("output.ppm", d_accumBuffer, width, height);
+	convertAndOpenImage("output.ppm", "output.jpg");
 
 
 
@@ -627,7 +1285,9 @@ int main()
 	CUDA_CHECK(cudaFree(d_hit_records));
 	CUDA_CHECK(cudaFree(d_materials));
 	CUDA_CHECK(cudaFree(d_randStates));
-	CUDA_CHECK(cudaFree(d_finalColor));
+	CUDA_CHECK(cudaFree(d_lightIndices));
+	CUDA_CHECK(cudaFree(d_shadowRays));
+	CUDA_CHECK(cudaFree(d_shadowHitRecords));
 
 
 

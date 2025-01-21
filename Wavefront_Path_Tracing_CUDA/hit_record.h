@@ -37,3 +37,13 @@ struct hit_record
     {
     }
 };
+
+
+
+
+// For shadow rays
+struct shadow_hit_record {
+    bool didHit;
+    float t;
+    // delete unused stuff 
+};
