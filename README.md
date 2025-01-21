@@ -1,5 +1,9 @@
 # Wavefront Path Tracing with CUDA
 
+![output](https://github.com/user-attachments/assets/fd5b0669-544b-4f44-aac2-26e9fb6b7a78)
+
+
+
 ## Overview
 This repository contains a Wavefront Path Tracing implementation using NVIDIA CUDA. The program is designed to perform photorealistic rendering using advanced GPU-based algorithms for efficiency and accuracy.
 
