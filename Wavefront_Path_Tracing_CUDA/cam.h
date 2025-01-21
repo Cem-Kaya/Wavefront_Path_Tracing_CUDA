@@ -11,11 +11,11 @@
 
 struct Camera
 {
-    Vec3 position;
-    Vec3 forward;
-    Vec3 right;
-    Vec3 up;
-    float fov;     // e.g. 45 degrees
+	Vec3 position;  // Camera position in world space in 3d 
+	Vec3 forward; // Forward direction 
+	Vec3 right; // Right direction
+	Vec3 up;	// Up direction
+	float fov;     // field of view in arc degrees
     float aspect;  // width / height
 
     __host__ __device__
@@ -24,7 +24,7 @@ struct Camera
     {
     }
 
-    // A simple function to configure camera for look-at settings
+    // A  function to configure camera for look-at settings
     __host__ __device__
         void setLookAt(const Vec3& pos, const Vec3& target, const Vec3& upVec, float fovDeg, float aspectRatio)
     {
@@ -44,7 +44,7 @@ struct Camera
         float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
 
         // Map u,v to [-1,1] range in camera space
-        float tanHalfFov = tanf((fov * 0.5f) * (3.14159265f / 180.0f));
+        float tanHalfFov = tanf((fov * 0.5f) * (3.14159 / 180.0f));
         float px = (2.0f * u - 1.0f) * aspect * tanHalfFov;
         float py = (1.0f - 2.0f * v) * tanHalfFov;
 

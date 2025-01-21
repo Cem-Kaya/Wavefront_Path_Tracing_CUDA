@@ -25,7 +25,7 @@ __device__ inline bool refract(const Vec3& v, const Vec3& n, float ni_over_nt, V
 }
 
 //-----------------------------------------------------------------------------
-// Material Enum & Data for GPU layout
+// Material Enum  Data for GPU layout
 //-----------------------------------------------------------------------------
 enum MaterialType {
     MATERIAL_LAMBERTIAN = 0,
@@ -38,7 +38,7 @@ enum MaterialType {
 struct GPU_Material {
     MaterialType type;
 
-    // Base color or albedo (used by lambertian, metal, etc.)
+    // Base color or albedo (used by lambertian, metal, colored dielectrics )
     Vec3 albedo;
 
     // For metal: fuzz parameter
@@ -72,7 +72,7 @@ __device__ Vec3 random_in_unit_sphere(curandState* state) {
 }
 
 //-----------------------------------------------------------------------------
-// Emitted: Only "diffuse_light" returns non-zero emission
+// Emitted Only diffuse_light returns non-zero emission
 //-----------------------------------------------------------------------------
 __device__ Vec3 emitted(const GPU_Material& mat, const hit_record& rec)
 {
@@ -83,10 +83,7 @@ __device__ Vec3 emitted(const GPU_Material& mat, const hit_record& rec)
 }
 
 //-----------------------------------------------------------------------------
-// Scatter: modifies the ray (scattered) and returns attenuation
-// We pass in: 
-//   - d_randStates: array of RNG states
-//   - idx: the thread/pixel index
+// Scatter Function
 //-----------------------------------------------------------------------------
 __device__ bool scatter(
     const GPU_Material& mat,

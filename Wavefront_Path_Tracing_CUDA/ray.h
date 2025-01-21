@@ -20,10 +20,10 @@ struct Ray
 struct ShadowRay {
 	Ray ray;            // The actual ray
 	int pixelIdx;       // which pixel/path does this shadow ray belong to?
-	Vec3 lightNormal;  
+	Vec3 lightNormal;  // The normal of the light source
 	Vec3 lightEmission; // store the emission color of the sampled light
-	Vec3 brdfFactor;    // how much we multiply if unoccluded
-	bool active;
-	float cosSurf; 
+	Vec3 brdfFactor;    //BSDF to be more spesific how much we multiply if unoccluded pbrt book 3rd edition 
+	bool active; 	// is this ray still active
+	float cosSurf; // cos of the angle between the surface normal and the ray direction
 	float distanceToLight; // somehow light leakes to the other side
 };

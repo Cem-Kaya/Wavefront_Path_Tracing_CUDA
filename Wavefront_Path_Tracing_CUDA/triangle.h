@@ -15,11 +15,9 @@ struct Triangle
     Vec3 v0;
     Vec3 v1;
     Vec3 v2;
-    int  materialID;  // <--- the index in the GPU_Material array
+    int  materialID;  // the index in the GPU_Material array
 
-    // Optional: per-triangle normal (e.g., flat shading)
-    // You might compute this once in your setup:
-    //   normal = cross(v1 - v0, v2 - v0).normalized();
+
     Vec3 normal;
 };
 

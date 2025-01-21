@@ -5,6 +5,8 @@
 #include <stdio.h>
 
 
+// 3D vector
+
 struct Vec3
 {
     float x, y, z;
