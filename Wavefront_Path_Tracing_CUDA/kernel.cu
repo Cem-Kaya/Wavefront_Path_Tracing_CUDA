@@ -8,6 +8,7 @@
 #include <iostream>    
 #include <vector>
 #include <string>
+#include <chrono> 
 
 #include "vec3.h"
 #include "cam.h"
@@ -227,7 +228,6 @@ void extendRays(
 }
 
 
-#include <curand_kernel.h>
 
 // Example threshold and survival probability
 #define RUSSIAN_ROULETTE_START_BOUNCE 5
@@ -258,7 +258,7 @@ __global__ void shadeKernel(
 	// If  didn't hit anything, it hit the background  sky skycolor !!!!!
 	if (!rec.didHit) {
 		//  background color
-		rec.accumulatedColor = rec.accumulatedColor +  rec.throughput * make_vec3(0.1f, 0.1f, 0.1f);
+		rec.accumulatedColor = rec.accumulatedColor +  rec.throughput * make_vec3(0.0f, 0.0f, 0.0f);
 		rec.active = false;
 		return;
 	}
@@ -632,7 +632,7 @@ void createMaterials(std::vector<GPU_Material>& mats)
 		GPU_Material metalMat;
 		metalMat.type = MATERIAL_METAL;
 		metalMat.albedo = make_vec3(0.95f, 0.95f, 0.95f); // near mirror
-		metalMat.fuzz = 0.0f;  // no fuzz => perfect reflection
+		metalMat.fuzz = 0.2f;  // no fuzz => perfect reflection
 		metalMat.ir = 1.0f;
 		metalMat.emission = make_vec3(0.f, 0.f, 0.f);
 		mats.push_back(metalMat);
@@ -685,6 +685,7 @@ void createSimpleScene(std::vector<Triangle>& triangles) {
 
 	// Another triangle with metal,
 }
+
 void createMoreComplexScene(std::vector<Triangle>& triangles)
 {
 	triangles.clear();
@@ -702,7 +703,7 @@ void createMoreComplexScene(std::vector<Triangle>& triangles)
 		// first floor triangle
 		triangles.push_back(makeTriangle(A, B, C, /*materialID=*/0));
 		// second floor triangle
-		triangles.push_back(makeTriangle(A, C, D, /*materialID=*/0));
+		triangles.push_back(makeTriangle(A, C, D, /*materialID=*/9));
 	}
 
 	//
@@ -781,8 +782,8 @@ void createEnclosedCubeScene(std::vector<Triangle>& triangles)
 		Vec3 C(boxMin, yCeiling, boxMin);
 		Vec3 D(boxMin, yCeiling, boxMax);
 
-		triangles.push_back(makeTriangle(A, B, C, 1));
-		triangles.push_back(makeTriangle(A, C, D, 1));
+		triangles.push_back(makeTriangle(A, B, C, 8));
+		triangles.push_back(makeTriangle(A, C, D, 8));
 	}
 
 	//
@@ -851,6 +852,89 @@ void createEnclosedCubeScene(std::vector<Triangle>& triangles)
 			tri.v0 = tri.v0 +  offsetLeft;
 			tri.v1 = tri.v1 +  offsetLeft;
 			tri.v2 = tri.v2 +  offsetLeft;
+			tri.normal = computeNormal(tri.v0, tri.v1, tri.v2);
+		}
+		triangles.insert(triangles.end(), sphereLeft.begin(), sphereLeft.end());
+
+		// sphere_right.obj, offset it to the right
+		Vec3 offsetRight = make_vec3(3.2f, 3.0f, 5.0f);
+		std::vector<Triangle> sphereRight = parseObj("../mesh/sphere.obj", /*materialID=*/2);
+		for (auto& tri : sphereRight) {
+			tri.v0 = tri.v0 + offsetRight;
+			tri.v1 = tri.v1 + offsetRight;
+			tri.v2 = tri.v2 + offsetRight;
+			tri.normal = computeNormal(tri.v0, tri.v1, tri.v2);
+		}
+		triangles.insert(triangles.end(), sphereRight.begin(), sphereRight.end());
+	}
+}
+
+
+void createEnclosedCubeScene2(std::vector<Triangle>& triangles)
+{
+	triangles.clear();
+
+	float boxMin = 0.f;
+	float boxMax = 5.f;
+	float yCeiling = 5.f;
+
+	//
+	// 1) Floor: white lambert (ID=0)
+	//
+	{
+		Vec3 A(boxMin, 0.f, boxMin);
+		Vec3 B(boxMax, 0.f, boxMin);
+		Vec3 C(boxMax, 0.f, boxMax);
+		Vec3 D(boxMin, 0.f, boxMax);
+
+		triangles.push_back(makeTriangle(A, C, B, /*materialID=*/0));
+		triangles.push_back(makeTriangle(A, D, C, /*materialID=*/0));
+	}
+
+	
+
+	
+
+	//
+	// 5) Ceiling + Emissive Light
+	//
+	{
+		// Big white ceiling
+		Vec3 A(boxMin, yCeiling, boxMin);
+		Vec3 B(boxMax, yCeiling, boxMin);
+		Vec3 C(boxMax, yCeiling, boxMax);
+		Vec3 D(boxMin, yCeiling, boxMax);
+
+		//triangles.push_back(makeTriangle(A, B, C, 0));
+		//triangles.push_back(makeTriangle(A, C, D, 0));
+
+		// Smaller rectangle for the light (ID=3)
+		float lightSize = 2.f;
+		float start = (boxMax - lightSize) * 0.5f;
+		float end = start + lightSize;
+
+		Vec3 L1(start, yCeiling - 0.001f, start);
+		Vec3 L2(end, yCeiling - 0.001f, start);
+		Vec3 L3(end, yCeiling - 0.001f, end);
+		Vec3 L4(start, yCeiling - 0.001f, end);
+
+		triangles.push_back(makeTriangle(L1, L2, L3, 9));
+		triangles.push_back(makeTriangle(L1, L3, L4, 9));
+	}
+
+	//
+	// 6) Spheres: loaded from .obj, offset inside the box
+	//
+	{
+		// sphere.obj, offset  to  left
+		Vec3 offsetLeft = make_vec3(1.2f, 2.f, 2.0f);
+		std::vector<Triangle> sphereLeft = parseObj("../mesh/mesh_from_nerf.obj", /*materialID=*/1);
+
+		// Add the offset can store and do it for ray but this also works 
+		for (auto& tri : sphereLeft) {
+			tri.v0 = tri.v0 + offsetLeft;
+			tri.v1 = tri.v1 + offsetLeft;
+			tri.v2 = tri.v2 + offsetLeft;
 			tri.normal = computeNormal(tri.v0, tri.v1, tri.v2);
 		}
 		triangles.insert(triangles.end(), sphereLeft.begin(), sphereLeft.end());
@@ -1106,8 +1190,20 @@ int main()
 	//  image resolution
 	int width = 1920;
 	int height = 1080;
-	int maxBounces = 20;
-	int samplesPerPixel = 500; // for demonstration
+	int maxBounces = 15;
+	int samplesPerPixel = 512; // for demonstration
+
+
+	
+	auto lastTime = std::chrono::high_resolution_clock::now();
+	auto now = std::chrono::high_resolution_clock::now();
+	auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+	lastTime = now;
+
+
+	
+
+
 
 	Vec3* d_accumBuffer = nullptr;
 	cudaMallocManaged(&d_accumBuffer, width * height * sizeof(Vec3));
@@ -1129,7 +1225,7 @@ int main()
 		//   x=2.5, y=2.5, z=-10  (in front of the box along negative Z)
 		make_vec3(2.5f, 2.5f, 2.5f),  // look at the center of the box
 		make_vec3(0.f, 1.f, 0.f), // 'up' vector
-		35.0f,                         // FOV in degrees
+		35.0f,                          // FOV in degrees
 		static_cast<float>(width) / static_cast<float>(height) // aspect ratio
 	);
 
@@ -1172,8 +1268,8 @@ int main()
 	
 	//  Create scene triangles
 	std::vector<Triangle> h_triangles;
-	//createMoreComplexScene(h_triangles);
-	createEnclosedCubeScene(h_triangles); 
+	createEnclosedCubeScene(h_triangles);
+	//createEnclosedCubeScene2(h_triangles);
 
 	int numTriangles = static_cast<int>(h_triangles.size());
 
@@ -1233,7 +1329,10 @@ int main()
 
 
 
-
+	now = std::chrono::high_resolution_clock::now();
+	elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+	std::cout << "Time taken  for scene set up  " << elapsed << " micro sec\n";
+	lastTime = now;
 
 
 	// -----------------------
@@ -1244,13 +1343,19 @@ int main()
 	{
 		// 1) Generate primary rays
 		generatePrimaryRays(d_rays, d_hit_records, h_camera, width, height);
-
+		now = std::chrono::high_resolution_clock::now();
+		elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+		std::cout << "Time taken  for Primary  " << elapsed << " micro sec\n";
+		lastTime = now;
 		// 2) For each bounce
 		for (int b = 0; b < maxBounces; b++)
 		{
 			// Extend rays
 			extendRays(d_rays, d_triangles, numTriangles, d_hit_records, width, height);
-
+			now = std::chrono::high_resolution_clock::now();
+			elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+			std::cout << "Time taken  for extand  " << elapsed << " micro sec\n";
+			lastTime = now;
 			// Shade
 			{
 				dim3 block(32, 32);
@@ -1267,55 +1372,71 @@ int main()
 					);
 				CUDA_CHECK(cudaDeviceSynchronize());
 			}
+			now = std::chrono::high_resolution_clock::now();
+			elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+			std::cout << "Time taken  for shade  " << elapsed << " micro sec\n";
+			lastTime = now;
+			
 
-			// Next Event Estimation generate shadow rays from each live path
+			// ---------------------------------------------------------
+			// Only do the shadow-ray logic if "useShadowRays" is true
+			//
+			// ---------------------------------------------------------
+			bool useShadowRays = true; 
+			if (useShadowRays)
 			{
-				dim3 block(32, 32);
-				dim3 grid((width + 15) / 16, (height + 15) / 16);
-				generateShadowRaysKernel << <grid, block >> > (
-					d_hit_records,
-					d_rays,
-					d_triangles,
-					d_materials,
-					d_lightIndices,
-					numLights,
-					d_shadowRays,
-					width,
-					height,
-					d_randStates
-					);
-				CUDA_CHECK(cudaDeviceSynchronize());
-			}
+				// Next Event Estimation (Shadow Rays)
+				{
+					dim3 block(32, 32);
+					dim3 grid((width + 31) / 32, (height + 31) / 32);
+					generateShadowRaysKernel << <grid, block >> > (
+						d_hit_records,
+						d_rays,
+						d_triangles,
+						d_materials,
+						d_lightIndices,
+						numLights,
+						d_shadowRays,
+						width,
+						height,
+						d_randStates
+						);
+					CUDA_CHECK(cudaDeviceSynchronize());
+				}
 
-			// Intersect shadow rays
-			{
-				dim3 block(32, 32);
-				dim3 grid((width + 15) / 16, (height + 15) / 16);
-				extendShadowRaysKernel << <grid, block >> > (
-					d_shadowRays,
-					d_triangles,
-					numTriangles,
-					d_shadowHitRecords,
-					width,
-					height
-					);
-				CUDA_CHECK(cudaDeviceSynchronize());
-			}
+				// Intersect shadow rays
+				{
+					dim3 block(32, 32);
+					dim3 grid((width + 31) / 32, (height + 31) / 32);
+					extendShadowRaysKernel << <grid, block >> > (
+						d_shadowRays,
+						d_triangles,
+						numTriangles,
+						d_shadowHitRecords,
+						width,
+						height
+						);
+					CUDA_CHECK(cudaDeviceSynchronize());
+				}
 
-			// Accumulate shadow
-			{
-				dim3 block(32, 32);
-				dim3 grid((width + 15) / 16, (height + 15) / 16);
-				finalizeShadowKernel << <grid, block >> > (
-					d_hit_records,
-					d_shadowRays,
-					d_shadowHitRecords,
-					width,
-					height
-					);
-				CUDA_CHECK(cudaDeviceSynchronize());
-			}
-
+				// Accumulate shadow
+				{
+					dim3 block(32, 32);
+					dim3 grid((width + 31) / 32, (height + 31) / 32);
+					finalizeShadowKernel << <grid, block >> > (
+						d_hit_records,
+						d_shadowRays,
+						d_shadowHitRecords,
+						width,
+						height
+						);
+					CUDA_CHECK(cudaDeviceSynchronize());
+				}
+			} // end if(useShadowRays)
+			now = std::chrono::high_resolution_clock::now();
+			elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+			std::cout << "Time taken  for shadowray  " << elapsed << " micro sec\n";
+			lastTime = now;
 			// If all paths are inactive, we could break early, but  not implemented , yet // did it 
 
 			cudaMemset(d_anyActive, 0, sizeof(int));
@@ -1345,6 +1466,10 @@ int main()
 			accumulateKernel << <grid, block >> > (d_hit_records, d_accumBuffer, width, height);
 			CUDA_CHECK(cudaDeviceSynchronize());
 		}
+		now = std::chrono::high_resolution_clock::now();
+		elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+		std::cout << "Time taken  for accumulate  " << elapsed << " micro sec\n";
+		lastTime = now;
 		
 	} // end sample loop
 	{
@@ -1352,6 +1477,11 @@ int main()
 		dim3 grid((width + 15) / 16, (height + 15) / 16);
 		averageKernel << <grid, block >> > (d_accumBuffer, width, height, samplesPerPixel);
 		CUDA_CHECK(cudaDeviceSynchronize());
+
+		now = std::chrono::high_resolution_clock::now();
+		elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastTime).count();
+		std::cout << "Time taken  for avarage  " << elapsed << " micro sec\n";
+		lastTime = now;
 	}
 
 	writeImageToCSV("final_color.csv", d_hit_records, width, height);
